@@ -8,186 +8,185 @@ from langchain.chains import LLMChain
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
-# Initialize the LLm with Groq API key and model
-
+# Initialize LLM
 llm = ChatGroq(
     groq_api_key=os.getenv("GROQ_API_KEY"),
     model="deepseek-r1-distill-llama-70b",
-    temperature=0.7
-    
+    temperature=0.7,
 )
-# SQLite setup with context manager for better handling
-def get_db_connection():
+
+# Database utility
+def init_db():
     conn = sqlite3.connect("language_mistakes.db")
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS mistakes 
-                      (id INTEGER PRIMARY KEY, user_input TEXT, mistake TEXT, correction TEXT, timestamp TEXT)''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS mistakes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_input TEXT,
+            mistake TEXT,
+            correction TEXT,
+            timestamp TEXT
+        )
+    ''')
     conn.commit()
-    return conn, cursor
+    return conn
 
-# Scene options by proficiency level
-def get_scene_options(level):
-    scenes = {
-        "beginner": [
-            "You’re at a market buying fruit.",
-            "You’re greeting a neighbor in your new town.",
-            "You’re asking for directions to a park."
-        ],
-        "intermediate": [
-            "You’re ordering a meal at a restaurant.",
-            "You’re shopping for clothes in a store.",
-            "You’re booking a hotel room over the phone."
-        ],
-        "advanced": [
-            "You’re negotiating a business deal.",
-            "You’re discussing a news article with a friend.",
-            "You’re giving a presentation at work."
-        ]
-    }
-    return scenes.get(level.lower(), scenes["beginner"])
+# Scene options
+SCENES = {
+    "Beginner": [
+        "You’re at a market buying fruit.",
+        "You’re greeting a neighbor in your new town.",
+        "You’re asking for directions to a park."
+    ],
+    "Intermediate": [
+        "You’re ordering a meal at a restaurant.",
+        "You’re shopping for clothes in a store.",
+        "You’re booking a hotel room over the phone."
+    ],
+    "Advanced": [
+        "You’re negotiating a business deal.",
+        "You’re discussing a news article with a friend.",
+        "You’re giving a presentation at work."
+    ]
+}
 
-# Correct user input and track mistakes
-def correct_input(user_input, target_lang, native_lang, conn, cursor):
-    prompt = PromptTemplate(
-        input_variables=["input", "target", "native"],
-        template="The user said: '{input}' in {target}. If there’s a mistake, correct it and explain in {native}. If correct, say 'Correct!'"
+# Prompt templates
+CORRECTION_PROMPT = PromptTemplate(
+    input_variables=["input", "target", "native", "scene"],
+    template=(
+        "The user said: '{input}' in {target}.\n"
+        "Correct any mistakes WITHOUT changing the writing system (Latin, Cyrillic, Devanagari, etc).\n"
+        "Make corrections based on the context: {scene}.\n"
+        "If correct, reply exactly 'Correct!'.\n"
+        "Briefly explain corrections in {native}."
     )
-    chain = LLMChain(llm=llm, prompt=prompt)
-    response = chain.run(input=user_input, target=target_lang, native=native_lang)
+)
+
+RESPONSE_PROMPT = PromptTemplate(
+    input_variables=["scene", "input", "target_lang"],
+    template=(
+        "Generate a response to '{input}' in '{target_lang}', staying consistent with the scene: {scene}.\n"
+        "Use the same writing system as the input."
+    )
+)
+
+# Utility functions
+def clean_response(text):
+    """Remove <think> tags."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+def correct_input(user_input, target_lang, native_lang, scene, conn):
+    chain = LLMChain(llm=llm, prompt=CORRECTION_PROMPT)
+    response = chain.run(input=user_input, target=target_lang, native=native_lang, scene=scene)
     
     if "Correct!" not in response:
-        # Robust parsing of response (assuming OpenAI returns something like "Mistake: ... Corrected to: ...")
-        mistake = user_input
-        correction = "Unknown"
-        if "Corrected to:" in response:
-            try:
-                correction = response.split("Corrected to:")[1].split(".")[0].strip()
-            except IndexError:
-                correction = "Parsing error - check response format"
-        cursor.execute("INSERT INTO mistakes (user_input, mistake, correction, timestamp) VALUES (?, ?, ?, ?)",
-                       (user_input, mistake, correction, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        try:
+            correction = response.split("Corrected to:")[1].split(".")[0].strip()
+        except (IndexError, AttributeError):
+            correction = "Parsing error - check LLM output."
+        
+        conn.execute(
+            "INSERT INTO mistakes (user_input, mistake, correction, timestamp) VALUES (?, ?, ?, ?)",
+            (user_input, user_input, correction, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
         conn.commit()
-    return response
-
-# Generate bot response in target language
-def clean_response(response):
-    """Removes any reasoning tags like <think>...</think> from the response."""
-    return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+    
+    return clean_response(response)
 
 def generate_response(user_input, target_lang, scene):
-    prompt = PromptTemplate(
-        input_variables=["scene", "input", "target_lang"],
-        template="Respond to '{input}' in {target_lang} based on this scene: {scene}"
-    )
-    chain = LLMChain(llm=llm, prompt=prompt)
-    raw_response = chain.run(scene=scene, input=user_input, target_lang=target_lang)
-    
-    return clean_response(raw_response)
+    chain = LLMChain(llm=llm, prompt=RESPONSE_PROMPT)
+    return clean_response(chain.run(scene=scene, input=user_input, target_lang=target_lang))
 
-# Review mistakes
-def review_mistakes(cursor):
+def review_mistakes(conn):
+    cursor = conn.cursor()
     cursor.execute("SELECT user_input, mistake, correction FROM mistakes")
-    mistakes = cursor.fetchall()
-    if not mistakes:
-        return "No mistakes recorded. Great job!"
+    rows = cursor.fetchall()
     
-    review = "=== Mistake Review ===\n"
-    for i, (user_input, mistake, correction) in enumerate(mistakes, 1):
-        review += f"{i}. You said: '{user_input}' | Mistake: '{mistake}' | Correction: '{correction}'\n"
+    if not rows:
+        return "🎉 No mistakes recorded. Excellent work!"
     
-    focus = "Focus area: Work on verb conjugation and vocabulary." if len(mistakes) > 2 else "Focus area: You’re doing well, keep practicing!"
-    return review + focus
+    review = "📝 **Mistake Review:**\n\n"
+    for idx, (user_input, mistake, correction) in enumerate(rows, 1):
+        review += f"{idx}. **You said:** '{user_input}'\n   **Mistake:** '{mistake}' ➔ **Correction:** '{correction}'\n\n"
+    
+    focus = "**Focus Area:** Verb conjugation and vocabulary improvement." if len(rows) > 2 else "**Focus Area:** Keep practicing!"
+    return review + "\n\n" + focus
 
-# Streamlit UI
+# Main App
 def main():
-    st.title("Language Learning Chatbot")
-    
-    # Initialize session state
+    st.set_page_config(page_title="Language Learning Buddy", page_icon="🗣️")
+    st.title("🗣️ Language Learning Chatbot")
+
+    conn = init_db()
+
     if "stage" not in st.session_state:
-        st.session_state.stage = "setup"
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    if "target_lang" not in st.session_state:
-        st.session_state.target_lang = None
-    if "native_lang" not in st.session_state:
-        st.session_state.native_lang = None
-    if "level" not in st.session_state:
-        st.session_state.level = None
-    if "scene" not in st.session_state:
-        st.session_state.scene = None
+        st.session_state.update({
+            "stage": "setup",
+            "chat_history": [],
+            "target_lang": "",
+            "native_lang": "",
+            "level": "",
+            "scene": "",
+        })
 
-    # Get database connection
-    conn, cursor = get_db_connection()
+    stage = st.session_state.stage
 
-    # Setup stage
-    if st.session_state.stage == "setup":
-        st.write("Welcome! Let’s get started.")
+    if stage == "setup":
+        with st.form("setup_form"):
+            st.subheader("Let's get started!")
+            st.session_state.target_lang = st.text_input("Language you want to learn:", value=st.session_state.target_lang)
+            st.session_state.native_lang = st.text_input("Language you know:", value=st.session_state.native_lang)
+            st.session_state.level = st.selectbox("Your current level:", list(SCENES.keys()), index=list(SCENES.keys()).index(st.session_state.level) if st.session_state.level else 0)
+            if st.form_submit_button("Next"):
+                if all([st.session_state.target_lang, st.session_state.native_lang, st.session_state.level]):
+                    st.session_state.stage = "scene_selection"
+                    st.rerun()
+                else:
+                    st.error("🚨 Please complete all fields.")
+
+    elif stage == "scene_selection":
+        with st.form("scene_form"):
+            st.subheader(f"Choose a Scene for Practicing {st.session_state.target_lang}")
+            scenes = SCENES.get(st.session_state.level, SCENES["Beginner"])
+            st.session_state.scene = st.selectbox("Pick a Scene:", scenes)
+            if st.form_submit_button("Start Chatting"):
+                st.session_state.stage = "chat"
+                st.session_state.chat_history.append(f"**Scene:** {st.session_state.scene}")
+                st.rerun()
+
+    elif stage == "chat":
+        st.subheader(f"🎯 Scene: {st.session_state.scene}")
+        st.markdown(f"✍️ Practice speaking in **{st.session_state.target_lang}**. (Type **'exit'** to finish.)")
         
-        target_lang = st.text_input("What language do you want to learn? (e.g., Spanish, French)")
-        native_lang = st.text_input("What language do you already know? (e.g., English)")
-        level = st.selectbox("What’s your current level?", ["Beginner", "Intermediate", "Advanced"])
+        for msg in st.session_state.chat_history:
+            st.markdown(msg)
         
-        if st.button("Next"):
-            if target_lang and native_lang and level:
-                st.session_state.target_lang = target_lang
-                st.session_state.native_lang = native_lang
-                st.session_state.level = level
-                st.session_state.stage = "scene_selection"
-            else:
-                st.error("Please fill in all fields.")
-
-    # Scene selection stage
-    elif st.session_state.stage == "scene_selection":
-        st.write(f"Choose a scene to practice your {st.session_state.target_lang}:")
-        scene_options = get_scene_options(st.session_state.level)
-        scene_choice = st.selectbox("Pick a scene:", scene_options)
-        
-        if st.button("Start Chatting"):
-            st.session_state.scene = scene_choice
-            st.session_state.stage = "chat"
-            st.session_state.chat_history.append(f"Scene: {scene_choice}")
-
-    # Chat stage
-    elif st.session_state.stage == "chat":
-        st.write(f"Scene: {st.session_state.scene}")
-        st.write(f"Respond in {st.session_state.target_lang}. Type 'exit' to finish.")
-
-        # Display chat history
-        for message in st.session_state.chat_history:
-            st.write(message)
-
-        # User input
-        user_input = st.text_input("You:", key="user_input")
-        if st.button("Send"):
-            if user_input:
+        with st.form("chat_form", clear_on_submit=True):
+            user_input = st.text_input("You:")
+            if st.form_submit_button("Send") and user_input:
                 if user_input.lower() == "exit":
                     st.session_state.stage = "review"
+                    st.rerun()
                 else:
-                    # Bot response and feedback
                     bot_response = generate_response(user_input, st.session_state.target_lang, st.session_state.scene)
-                    f = correct_input(user_input, st.session_state.target_lang, st.session_state.native_lang, conn, cursor)
-                    feedback = clean_response(f)
-                    
-                    # Update chat history
-                    st.session_state.chat_history.append(f"You: {user_input}")
-                    st.session_state.chat_history.append(f"Bot: {bot_response}")
-                    st.session_state.chat_history.append(f"Feedback: {feedback}")
-                    st.rerun()  # Refresh to show updated chat
+                    feedback = correct_input(user_input, st.session_state.target_lang, st.session_state.native_lang, st.session_state.scene, conn)
+                    st.session_state.chat_history.extend([
+                        f"🧑‍🎓 **You:** {user_input}",
+                        f"🤖 **Bot:** {bot_response}",
+                        f"📝 **Feedback:** {feedback}"
+                    ])
+                    st.rerun()
 
-    # Review stage
-    elif st.session_state.stage == "review":
-        st.write("Chat ended. Here’s your review:")
-        review = review_mistakes(cursor)
-        st.write(review)
-        if st.button("Start Over"):
-            st.session_state.clear()  # Reset everything
+    elif stage == "review":
+        st.success("✅ Chat ended. Here's your review:")
+        st.markdown(review_mistakes(conn))
+        if st.button("🔄 Start Over"):
+            st.session_state.clear()
             st.rerun()
 
-    # Close database connection at the end of each run
     conn.close()
 
-# Run the app
 if __name__ == "__main__":
     main()
